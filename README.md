@@ -1,0 +1,1 @@
+# Sistem-Integrat-de-Gestiune-i-Analiz-de-Business-Intelligence-pentru-Retail-Lidl-Style-
