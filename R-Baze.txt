@@ -1,0 +1,196 @@
+library(tidyverse)
+library(RPostgres)
+
+con <- dbConnect(RPostgres::Postgres(),
+                 dbname = 'Normalizare_Tema',
+                 host = 'localhost',
+                 port = 5432,
+                 user = 'postgres',
+                 password = 'postgres')
+
+tables <- dbGetQuery(con, 
+                     "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+
+tables
+
+for(i in 1:nrow(tables)){
+  temp <- dbGetQuery(con, paste("select * from ", tables[i,1], sep=""))
+  assign(tables[i,1], temp)
+}
+
+rm(con,temp,i,tables)
+
+
+
+# 1. Cu grupare și filtrare
+# Cerință: Aflați numărul total de bonuri fiscale emise
+# și valoarea medie a unui bon pentru fiecare magazin în parte.
+
+rezultat_1 <- magazine %>%
+  left_join(bonuri_fiscale, by = "idmagazin") %>%
+  left_join(detalii_bon_fiscal, by = "idbonfiscal") %>%
+  group_by(idmagazin, oras) %>%
+  summarise(
+    numar_total_bonuri = n_distinct(idbonfiscal, na.rm = TRUE),
+    valoare_totala = sum(cantitate * pret_final, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    valoare_medie_bon = if_else(
+      numar_total_bonuri == 0, 
+      0, 
+      round(valoare_totala / numar_total_bonuri, 2)
+    )
+  ) %>%
+  select(idmagazin, oras, numar_total_bonuri, valoare_medie_bon) %>%
+  arrange(desc(numar_total_bonuri))
+
+# 2. Cu subconsultări în clauza HAVING și FROM
+# Cerință: Afișați magazinul și numărul de casieri, 
+# dar doar pentru magazinele unde numărul de casieri depășește media pe rețea.
+
+media_casieri_retea <- angajati %>%
+  filter(functie == "Casier") %>%
+  group_by(idmagazin) %>%
+  summarise(nr_casieri = n(), .groups = "drop") %>%
+  summarise(medie = mean(nr_casieri)) %>%
+  pull(medie)
+
+rezultat_2 <- magazine %>%
+  inner_join(angajati %>% filter(functie == "Casier"), by = "idmagazin") %>%
+  group_by(idmagazin, oras, adresa) %>%
+  summarise(numar_casieri = n(), .groups = "drop") %>%
+  filter(numar_casieri > media_casieri_retea) %>%
+  arrange(desc(numar_casieri))
+
+
+
+# 3. Cu expresii-tabelă (CTE) și "tabele-pivot"
+# Cerință: Generați un raport pivot care afișează stocul produselor pe două coloane,
+# în funcție de tipul magazinului ('Standard' și 'Supermagazin/XL').
+
+rezultat_3 <- produse %>%
+  inner_join(stocuri, by = "idprodus") %>%
+  inner_join(magazine, by = "idmagazin") %>%
+  group_by(nume_produs, tip) %>%
+  summarise(cantitate_totala = sum(cantitate_disp, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from = tip,
+    values_from = cantitate_totala,
+    values_fill = list(cantitate_totala = 0)
+  ) %>%
+  rename(
+    stoc_standard = Standard,
+    stoc_supermagazin = `Supermagazin/XL`
+  ) %>%
+  select(nume_produs, any_of(c("stoc_standard", "stoc_supermagazin"))) %>%
+  arrange(nume_produs)
+
+
+
+# 4. Interogări (pseudo) recursive
+# Cerință: Generați recursiv pragurile de analiză a stocurilor 
+# (de la 10 la 50 de bucăți, din 10 în 10) și 
+# numărați câte produse din baza de date se află la sau sub fiecare prag de alertă.
+
+praguri <- tibble(prag_cantitate = seq(10, 50, by = 10))
+rezultat_4 <- praguri %>%
+  
+  cross_join(stocuri) %>%
+  filter(cantitate_disp <= prag_cantitate) %>%
+  group_by(prag_cantitate) %>%
+  summarise(numar_produse_sub_prag = n_distinct(idprodus), .groups = "drop") %>%
+  right_join(praguri, by = "prag_cantitate") %>%
+  mutate(numar_produse_sub_prag = replace_na(numar_produse_sub_prag, 0)) %>%
+  arrange(prag_cantitate)
+
+
+#1. cu grupare și filtrare
+
+#Afișați furnizorii care au realizat cel puțin două livrări 
+#și a căror valoare medie a aprovizionărilor depășește 
+#media generală a tuturor aprovizionărilor din sistem.
+
+media_globala <- mean(aprovizionare$total_plata, na.rm = TRUE)
+
+rezolvare_1 <- furnizori %>%
+  inner_join(aprovizionare, by = "idfurnizor") %>%
+  group_by(idfurnizor, nume_furnizor) %>%
+  summarize(
+    nr_livrari = n(),
+    medie_aprovizionari = mean(total_plata, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(nr_livrari >= 2 & medie_aprovizionari > media_globala)
+
+
+#2. cu subconsultări în clauza HAVING și/sau FROM
+
+#Afișați produsele și cantitatea totală vândută prin plata cu cardul,
+#doar pentru produsele a căror cantitate totală vândută depășește 
+#media globală a cantităților vândute per produs.
+
+card_subquery <- detalii_bon_fiscal %>%
+  inner_join(bonuri_fiscale, by = "idbonfiscal") %>%
+  filter(mod_plata == "Card") %>%
+  select(idprodus, cantitate_vanduta = cantitate)
+
+media_globala_card <- detalii_bon_fiscal %>%
+  inner_join(bonuri_fiscale, by = "idbonfiscal") %>%
+  filter(mod_plata == "Card") %>%
+  group_by(idprodus) %>%
+  summarize(total_produs = sum(cantitate, na.rm = TRUE)) %>%
+  summarize(medie = mean(total_produs, na.rm = TRUE)) %>%
+  pull(medie)
+
+rezolvare_2 <- produse %>%
+  inner_join(card_subquery, by = "idprodus") %>%
+  group_by(idprodus, nume_produs) %>%
+  summarize(total_vandut_card = sum(cantitate_vanduta, na.rm = TRUE), .groups = "drop") %>%
+  filter(total_vandut_card > media_globala_card) %>%
+  arrange(desc(total_vandut_card))
+
+
+#3. cu expresii-tabelă și "tabele-pivot" (cu sau fără joncțiuni externe)
+
+#Generați un raport pivot care afișează valoarea totală a vânzărilor
+#pentru fiecare categorie de produse, separată în 
+#funcție de metoda de plată utilizată.
+
+vanzari_categorii <- categorii %>%
+  inner_join(produse, by = "idcategorie") %>%
+  inner_join(detalii_bon_fiscal, by = "idprodus") %>%
+  inner_join(bonuri_fiscale, by = "idbonfiscal") %>%
+  group_by(denumire, mod_plata) %>%
+  summarize(valoare_vanzari = sum(cantitate * pret_final, na.rm = TRUE), .groups = "drop")
+
+rezolvare_3 <- vanzari_categorii %>%
+  pivot_wider(
+    names_from = mod_plata,
+    values_from = valoare_vanzari,
+    values_fill = 0
+  ) %>%
+  select(denumire, cash = Cash, card = Card, lidl_pay = `Lidl Pay`) %>%
+  arrange(denumire)
+
+
+#4. interogări (pseudo) recursive
+
+#Generați recursiv pragurile de fidelitate pentru aplicația Lidl Plus
+#(de la 100 la 500 de puncte, din 100 în 100) și determinați 
+# numărul de clienți care au acumulat suficiente puncte pentru a atinge fiecare prag.
+
+praguri <- data.frame(prag = seq(100, 500, by = 100))
+
+rezolvare_4 <- praguri %>%
+  inner_join(cont_lidl_plus, by = join_by(prag <= puncte_acumulate)) %>%
+  inner_join(clienti, by = "idclient") %>%
+  select(prag, nume, prenume, puncte_acumulate) %>%
+  arrange(prag, puncte_acumulate)
+
+
+
+
+
+
+
